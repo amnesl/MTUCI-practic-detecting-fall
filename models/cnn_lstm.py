@@ -1,5 +1,5 @@
 """
-Модель CNN + LSTM для детекции падения
+CNN + LSTM модель для детекции падений
 """
 
 import torch
@@ -8,50 +8,68 @@ import torchvision.models as models
 
 
 class CNNLSTM(nn.Module):
-    """CNN + LSTM для классификации видеопоследовательностей"""
-    
-    def __init__(self, num_classes=2, hidden_size=256, num_layers=2):
+    def __init__(self, num_classes=2, lstm_hidden=256, lstm_layers=2, dropout=0.3):
         super(CNNLSTM, self).__init__()
         
-        # ResNet50 как экстрактор признаков (заморожен)
-        self.cnn = models.resnet50(pretrained=True)
-        self.cnn.fc = nn.Identity()  # убираем классификационную голову
-        # Замораживаем веса CNN
+        # CNN backbone (замороженный)
+        self.cnn = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        
+        # Замораживаем все слои
         for param in self.cnn.parameters():
             param.requires_grad = False
-        
-        # LSTM для временной обработки
-        self.lstm = nn.LSTM(
-            input_size=2048,  # выход ResNet50
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            bidirectional=True,
-            dropout=0.3
-        )
-        
-        # Классификационная голова
-        self.fc = nn.Sequential(
-            nn.Dropout(0.3),
-            nn.Linear(hidden_size * 2, 256),
-            nn.ReLU(),
-            nn.Linear(256, num_classes)
-        )
-    
-    def forward(self, x):
-        # x: (batch, T, C, H, W)
-        batch, T, C, H, W = x.shape
-        x = x.view(batch * T, C, H, W)
-        
-        # Извлечение признаков CNN (без градиентов)
-        with torch.no_grad():
-            features = self.cnn(x)  # (batch * T, 2048)
-        
-        features = features.view(batch, T, -1)  # (batch, T, 2048)
+            
+        # Размораживаем последние 2 слоя для тонкой настройки
+        for param in list(self.cnn.layer4.parameters())[-10:]:
+            param.requires_grad = True
+            
+        # Убираем классификатор ResNet
+        self.cnn.fc = nn.Identity()
         
         # LSTM
-        lstm_out, _ = self.lstm(features)  # (batch, T, hidden*2)
+        self.lstm = nn.LSTM(
+            input_size=512,  # выход ResNet18
+            hidden_size=lstm_hidden,
+            num_layers=lstm_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if lstm_layers > 1 else 0
+        )
         
-        # Берем последний временной шаг
-        output = self.fc(lstm_out[:, -1, :])
-        return output
+        # Классификатор
+        self.fc = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(lstm_hidden * 2, 128),  # *2 для bidirectional
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, num_classes)
+        )
+        
+    def forward(self, x):
+        """
+        Args:
+            x: [batch, frames, channels, height, width]
+        Returns:
+            logits: [batch, num_classes]
+        """
+        batch, frames, C, H, W = x.shape
+        
+        # Изменяем размерность для CNN: [batch * frames, C, H, W]
+        x = x.view(batch * frames, C, H, W)
+        
+        # Извлекаем признаки через CNN
+        with torch.no_grad():
+            features = self.cnn(x)  # [batch * frames, 512]
+        
+        # Возвращаем размерность: [batch, frames, 512]
+        features = features.view(batch, frames, -1)
+        
+        # LSTM
+        lstm_out, _ = self.lstm(features)  # [batch, frames, lstm_hidden*2]
+        
+        # Берем последний кадр
+        output = lstm_out[:, -1, :]  # [batch, lstm_hidden*2]
+        
+        # Классификация
+        logits = self.fc(output)  # [batch, num_classes]
+        
+        return logits

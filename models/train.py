@@ -11,24 +11,47 @@ import json
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
 import numpy as np
 
+def convert_numpy_to_python(obj):
+    """Рекурсивно преобразует все numpy-типы в Python-типы"""
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {key: convert_numpy_to_python(value) for key, value in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [convert_numpy_to_python(item) for item in obj]
+    else:
+        return obj
 
-def train_model(model, train_loader, val_loader, num_epochs=30, lr=1e-4, device='cuda', save_dir='runs/model'):
+
+def train_model(model, train_loader, val_loader, num_epochs=10, lr=1e-4, device='cuda', save_dir='runs/model'):
     """
     Обучение модели с сохранением лучших весов
     """
     device = torch.device(device if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
+    # 🔥 ВЕСА КЛАССОВ для борьбы с дисбалансом
+    class_weights = torch.tensor([1.0, 1.5]).to(device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
-    criterion = nn.CrossEntropyLoss()
     
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     
+    # 🔥 ПРОВЕРКА: является ли модель из библиотеки transformers
+    is_transformers_model = False
+    if hasattr(model, 'config') and hasattr(model.config, 'model_type'):
+        if model.config.model_type in ['timesformer', 'videomae']:
+            is_transformers_model = True
+            print(f"   🔍 Обнаружена модель {model.config.model_type}, использую pixel_values")
+    
     best_f1 = 0.0
-    patience = 5  # сколько эпох ждать улучшения
-    patience_counter = 0
     history = {
         'train_loss': [], 'val_loss': [],
         'val_acc': [], 'val_precision': [], 'val_recall': [], 'val_f1': []
@@ -44,9 +67,19 @@ def train_model(model, train_loader, val_loader, num_epochs=30, lr=1e-4, device=
             batch, labels = batch.to(device), labels.to(device)
             
             optimizer.zero_grad()
-            outputs = model(batch)
+            
+            # 🔥 Для моделей из transformers используем pixel_values
+            if is_transformers_model:
+                outputs = model(pixel_values=batch).logits
+            else:
+                outputs = model(batch)
+            
             loss = criterion(outputs, labels)
             loss.backward()
+            
+            # 🔥 Градиентное клиппинг для стабильности
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             optimizer.step()
             
             train_loss += loss.item()
@@ -62,7 +95,13 @@ def train_model(model, train_loader, val_loader, num_epochs=30, lr=1e-4, device=
         with torch.no_grad():
             for batch, labels in val_loader:
                 batch, labels = batch.to(device), labels.to(device)
-                outputs = model(batch)
+                
+                # 🔥 Для моделей из transformers используем pixel_values
+                if is_transformers_model:
+                    outputs = model(pixel_values=batch).logits
+                else:
+                    outputs = model(batch)
+                
                 loss = criterion(outputs, labels)
                 val_loss += loss.item()
                 
@@ -78,25 +117,19 @@ def train_model(model, train_loader, val_loader, num_epochs=30, lr=1e-4, device=
         rec = recall_score(all_labels, all_preds, average='binary', zero_division=0)
         f1 = f1_score(all_labels, all_preds, average='binary', zero_division=0)
         
-        # Сохраняем историю
-        history['train_loss'].append(avg_train_loss)
-        history['val_loss'].append(avg_val_loss)
-        history['val_acc'].append(acc)
-        history['val_precision'].append(prec)
-        history['val_recall'].append(rec)
-        history['val_f1'].append(f1)
+        # Сохраняем историю (конвертируем в Python типы)
+        history['train_loss'].append(float(avg_train_loss))
+        history['val_loss'].append(float(avg_val_loss))
+        history['val_acc'].append(float(acc))
+        history['val_precision'].append(float(prec))
+        history['val_recall'].append(float(rec))
+        history['val_f1'].append(float(f1))
         
         # Сохраняем лучшую модель
         if f1 > best_f1:
             best_f1 = f1
             torch.save(model.state_dict(), save_dir / 'best_model.pth')
-            patience_counter = 0
             print(f"  ✅ Сохранена новая лучшая модель (F1={f1:.4f})")
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print(f"  ⏹️ Early stopping на эпохе {epoch+1}")
-                break
         
         scheduler.step()
         
@@ -109,7 +142,7 @@ def train_model(model, train_loader, val_loader, num_epochs=30, lr=1e-4, device=
     
     # Сохраняем историю обучения
     with open(save_dir / 'history.json', 'w') as f:
-        json.dump(history, f)
+        json.dump(convert_numpy_to_python(history), f, indent=4)
     
     return history, best_f1
 
@@ -123,7 +156,19 @@ def evaluate_model(model, test_loader, device='cuda', save_dir='runs/model'):
     model.eval()
     
     # Загружаем лучшие веса
-    model.load_state_dict(torch.load(Path(save_dir) / 'best_model.pth'))
+    model_path = Path(save_dir) / 'best_model.pth'
+    if model_path.exists():
+        model.load_state_dict(torch.load(model_path))
+        print(f"✅ Загружены веса из {model_path}")
+    else:
+        print(f"⚠️ Внимание: файл {model_path} не найден, использую текущие веса")
+    
+    # 🔥 ПРОВЕРКА: является ли модель из библиотеки transformers
+    is_transformers_model = False
+    if hasattr(model, 'config') and hasattr(model.config, 'model_type'):
+        if model.config.model_type in ['timesformer', 'videomae']:
+            is_transformers_model = True
+            print(f"   🔍 Обнаружена модель {model.config.model_type}, использую pixel_values")
     
     all_preds = []
     all_labels = []
@@ -131,7 +176,13 @@ def evaluate_model(model, test_loader, device='cuda', save_dir='runs/model'):
     with torch.no_grad():
         for batch, labels in test_loader:
             batch, labels = batch.to(device), labels.to(device)
-            outputs = model(batch)
+            
+            # 🔥 Для моделей из transformers используем pixel_values
+            if is_transformers_model:
+                outputs = model(pixel_values=batch).logits
+            else:
+                outputs = model(batch)
+            
             preds = torch.argmax(outputs, dim=1)
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
@@ -145,14 +196,10 @@ def evaluate_model(model, test_loader, device='cuda', save_dir='runs/model'):
     rec = recall_score(all_labels, all_preds, average='binary', zero_division=0)
     f1 = f1_score(all_labels, all_preds, average='binary', zero_division=0)
     
-    # 🔧 ПРЕОБРАЗУЕМ ВСЕ В PYTHON-ТИПЫ ДЛЯ JSON 🔧
     results = {
-        'confusion_matrix': cm.tolist(),  # Преобразуем numpy array в list
-        'TP': int(TP),     # int64 → int
-        'TN': int(TN),
-        'FP': int(FP),
-        'FN': int(FN),
-        'accuracy': float(acc),   # float64 → float
+        'confusion_matrix': cm.tolist(),
+        'TP': int(TP), 'TN': int(TN), 'FP': int(FP), 'FN': int(FN),
+        'accuracy': float(acc),
         'precision': float(prec),
         'recall': float(rec),
         'f1_score': float(f1)
@@ -160,7 +207,7 @@ def evaluate_model(model, test_loader, device='cuda', save_dir='runs/model'):
     
     # Сохраняем результаты
     with open(Path(save_dir) / 'test_results.json', 'w') as f:
-        json.dump(results, f, indent=4)
+        json.dump(convert_numpy_to_python(results), f, indent=4)
     
     print(f"\n📊 Результаты на тестовой выборке:")
     print(f"  TP: {TP}, TN: {TN}, FP: {FP}, FN: {FN}")
